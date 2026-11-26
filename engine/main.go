@@ -44,7 +44,12 @@ type Msg struct {
 	Mine       bool   `json:"mine"`
 	TS         int64  `json:"ts"`
 	Text       string `json:"text"`
-	State      int    `json:"state"` // mine: 1 sent, 2 delivered, 3 read; incoming: 0 unread, 3 read
+	State      int    `json:"state"`          // mine: 1 sent, 2 delivered, 3 read; incoming: 0 unread, 3 read
+	Kind       string `json:"kind,omitempty"` // image, video, audio, ptt, document, sticker
+	Mime       string `json:"mime,omitempty"`
+	FileName   string `json:"fileName,omitempty"`
+	HasThumb   bool   `json:"hasThumb,omitempty"`
+	Raw        []byte `json:"-"`
 }
 
 type Event struct {
@@ -226,6 +231,13 @@ CREATE TABLE IF NOT EXISTS messages(chat TEXT NOT NULL, id TEXT NOT NULL, sender
   text TEXT NOT NULL DEFAULT '', state INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chat, id));
 CREATE INDEX IF NOT EXISTS messages_chat_ts ON messages(chat, ts);`)
 	}
+	if err == nil {
+		for _, col := range []string{"kind TEXT NOT NULL DEFAULT ''", "mime TEXT NOT NULL DEFAULT ''",
+			"fname TEXT NOT NULL DEFAULT ''", "thumb INTEGER NOT NULL DEFAULT 0", "raw BLOB"} {
+			a.db.Exec("ALTER TABLE messages ADD COLUMN " + col) // ignored if it already exists
+		}
+		os.MkdirAll(filepath.Join(a.data, "media"), 0700)
+	}
 	if err != nil {
 		a.setState("error", "Datenbank: "+err.Error())
 		return
@@ -329,6 +341,9 @@ func (a *App) onEvent(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Connected:
 		a.setState("connected", "")
+		a.scheduleNameRefresh()
+	case *events.Contact, *events.PushName, *events.AppStateSyncComplete, *events.BusinessName:
+		a.scheduleNameRefresh()
 	case *events.PairSuccess:
 		a.setState("connecting", "Gekoppelt, synchronisiere…")
 	case *events.Disconnected:
@@ -359,7 +374,7 @@ func (a *App) onEvent(evt interface{}) {
 		if state == 0 || len(v.MessageIDs) == 0 {
 			return
 		}
-		chat := v.Chat.String()
+		chat := a.normChat(v.Chat).String()
 		ids := make([]string, 0, len(v.MessageIDs))
 		for _, id := range v.MessageIDs {
 			ids = append(ids, string(id))
@@ -429,7 +444,7 @@ func (a *App) storeMessage(evt *events.Message, live bool) {
 	if a.db == nil || evt == nil {
 		return
 	}
-	chat := evt.Info.Chat
+	chat := a.normChat(evt.Info.Chat)
 	if chat.Server == types.BroadcastServer || chat.User == "status" {
 		return
 	}
@@ -446,6 +461,7 @@ func (a *App) storeMessage(evt *events.Message, live bool) {
 		TS:         evt.Info.Timestamp.Unix(),
 		Text:       text,
 	}
+	fillMedia(&m, evt.Message)
 	if m.Mine {
 		m.State = 1
 		m.SenderName = ""
@@ -465,8 +481,10 @@ func (a *App) storeMessage(evt *events.Message, live bool) {
 }
 
 func (a *App) insertMessage(m *Msg, countUnread bool) bool {
-	res, err := a.db.Exec(`INSERT OR IGNORE INTO messages(chat,id,sender,sender_name,mine,ts,text,state) VALUES(?,?,?,?,?,?,?,?)`,
-		m.Chat, m.ID, m.Sender, m.SenderName, boolInt(m.Mine), m.TS, m.Text, m.State)
+	res, err := a.db.Exec(`INSERT OR IGNORE INTO messages(chat,id,sender,sender_name,mine,ts,text,state,kind,mime,fname,thumb,raw)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		m.Chat, m.ID, m.Sender, m.SenderName, boolInt(m.Mine), m.TS, m.Text, m.State,
+		m.Kind, m.Mime, m.FileName, boolInt(m.HasThumb), m.Raw)
 	if err != nil {
 		fmt.Println("insert message:", err)
 		return false
@@ -502,12 +520,13 @@ func (a *App) storeHistory(v *events.HistorySync) {
 		return
 	}
 	for _, conv := range v.Data.GetConversations() {
-		chat, err := types.ParseJID(conv.GetID())
-		if err != nil || chat.Server == types.BroadcastServer {
+		rawChat, err := types.ParseJID(conv.GetID())
+		if err != nil || rawChat.Server == types.BroadcastServer {
 			continue
 		}
+		chat := a.normChat(rawChat)
 		for _, hm := range conv.GetMessages() {
-			evt, err := cli.ParseWebMessage(chat, hm.GetMessage())
+			evt, err := cli.ParseWebMessage(rawChat, hm.GetMessage())
 			if err != nil {
 				continue
 			}
@@ -570,15 +589,7 @@ func (a *App) nameWorker() {
 			}
 			time.Sleep(300 * time.Millisecond)
 		} else {
-			c, err := cli.Store.Contacts.GetContact(ctx, jid)
-			if err == nil && c.Found {
-				for _, n := range []string{c.FullName, c.FirstName, c.BusinessName, c.PushName} {
-					if n != "" {
-						name = n
-						break
-					}
-				}
-			}
+			name = a.contactName(ctx, jid, true)
 		}
 		if name != "" {
 			a.db.Exec(`UPDATE chats SET name=? WHERE jid=?`, name, jidStr)
@@ -624,6 +635,12 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/read", a.hRead)
 	mux.HandleFunc("/events", a.hEvents)
 	mux.HandleFunc("/logout", a.hLogout)
+	mux.HandleFunc("/thumb", a.hThumb)
+	mux.HandleFunc("/media", a.hMedia)
+	mux.HandleFunc("/sendmedia", a.hSendMedia)
+	mux.HandleFunc("/contacts", a.hContacts)
+	mux.HandleFunc("/contacts/refresh", a.hContactsRefresh)
+	mux.HandleFunc("/resolve", a.hResolve)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.token != "" && r.Header.Get("X-Token") != a.token {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -796,7 +813,7 @@ func (a *App) hMessages(w http.ResponseWriter, r *http.Request) {
 	if before <= 0 {
 		before = 1 << 62
 	}
-	rows, err := a.db.Query(`SELECT id,chat,sender,sender_name,mine,ts,text,state FROM messages
+	rows, err := a.db.Query(`SELECT id,chat,sender,sender_name,mine,ts,text,state,kind,mime,fname,thumb FROM messages
 WHERE chat=? AND ts<? ORDER BY ts DESC LIMIT ?`, q.Get("chat"), before, limit)
 	if err != nil {
 		fail(w, 500, err)
@@ -806,9 +823,11 @@ WHERE chat=? AND ts<? ORDER BY ts DESC LIMIT ?`, q.Get("chat"), before, limit)
 	out := []Msg{}
 	for rows.Next() {
 		var m Msg
-		var mine int
-		if rows.Scan(&m.ID, &m.Chat, &m.Sender, &m.SenderName, &mine, &m.TS, &m.Text, &m.State) == nil {
+		var mine, thumb int
+		if rows.Scan(&m.ID, &m.Chat, &m.Sender, &m.SenderName, &mine, &m.TS, &m.Text, &m.State,
+			&m.Kind, &m.Mime, &m.FileName, &thumb) == nil {
 			m.Mine = mine == 1
+			m.HasThumb = thumb == 1
 			out = append(out, m)
 		}
 	}
