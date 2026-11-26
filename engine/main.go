@@ -158,15 +158,20 @@ func main() {
 		names: make(chan string, 4096),
 	}
 
-	ln, err := net.Listen("tcp", *listen)
+	port := 0
+	if _, p, err := net.SplitHostPort(*listen); err == nil {
+		port, _ = strconv.Atoi(p)
+	}
+	ln, err := listenLocal(port)
 	if err != nil {
 		fmt.Println("FATAL listen:", err)
 		os.Exit(1)
 	}
 	go func() {
-		if err := http.Serve(ln, a.routes()); err != nil {
-			fmt.Println("FATAL http:", err)
-			os.Exit(1)
+		for {
+			err := http.Serve(ln, a.routes())
+			fmt.Println("http server stopped, restarting:", err)
+			time.Sleep(time.Second)
 		}
 	}()
 	fmt.Printf("ENGINE_READY %d\n", ln.Addr().(*net.TCPAddr).Port)
