@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build engine + APK
+        run: |
+          set -o pipefail
+          bash ci/build.sh 2>&1 | tee build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LegacyWA-apk
+          path: out/LegacyWA.apk
+
+      - name: Publish release "latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest out/LegacyWA.apk \
+            --title "LegacyWA – neuester Build (#${{ github.run_number }})" \
+            --notes "Automatisch gebaut aus ${{ github.sha }}. Datei LegacyWA.apk auf das Android-4-Handy laden und installieren." \
+            --target "${{ github.sha }}"
+
+      # Pushes the build log to the ci-logs branch so it can be read without the GitHub UI.
+      - name: Publish build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/ci-log
+          cp build.log /tmp/ci-log/build.log 2>/dev/null || echo "no log" > /tmp/ci-log/build.log
+          cp out/go.mod out/go.sum /tmp/ci-log/ 2>/dev/null || true
+          printf 'run=%s\nsha=%s\nstatus=%s\n' "${{ github.run_number }}" "${{ github.sha }}" "${{ job.status }}" > /tmp/ci-log/status.txt
+          cd /tmp/ci-log
+          git init -q -b ci-logs
+          git config user.name "ci" && git config user.email "ci@users.noreply.github.com"
+          git add -A && git commit -qm "build log #${{ github.run_number }}"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" ci-logs
