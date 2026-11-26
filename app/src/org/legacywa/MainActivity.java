@@ -390,6 +390,9 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
+        MenuItem nc = menu.add(0, 4, 0, "Neuer Chat");
+        nc.setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM | MenuItem.SHOW_AS_ACTION_WITH_TEXT);
+        menu.add(0, 5, 0, "Kontakte aktualisieren");
         menu.add(0, 1, 0, "Log anzeigen");
         menu.add(0, 2, 0, "Engine neu starten");
         menu.add(0, 3, 0, "Abmelden");
@@ -401,6 +404,12 @@ public class MainActivity extends Activity {
         switch (item.getItemId()) {
             case 1:
                 showLog();
+                return true;
+            case 4:
+                startActivity(new Intent(this, ContactsActivity.class));
+                return true;
+            case 5:
+                ContactsActivity.refresh(this, null);
                 return true;
             case 2:
                 restartEngine();

@@ -269,17 +269,29 @@ public class EngineService extends Service {
         }
     }
 
+    /** Unread notification counts per chat; cleared when the chat is opened. */
+    private static final java.util.Map<String, Integer> unread = new java.util.HashMap<String, Integer>();
+
     private void showMessage(String chat, JSONObject m) {
         String chatName = m.optString("chatName", chat);
         String text = m.optString("text");
         boolean group = chat.endsWith("@g.us");
         if (group && m.optString("senderName").length() > 0) text = m.optString("senderName") + ": " + text;
+        int count;
+        synchronized (unread) {
+            Integer c = unread.get(chat);
+            count = (c == null ? 0 : c) + 1;
+            unread.put(chat, count);
+        }
         Intent i = new Intent(this, ChatActivity.class);
         i.putExtra("jid", chat);
         i.putExtra("name", chatName);
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        String title = count > 1 ? chatName + " (" + count + " neue Nachrichten)" : chatName;
+        Notification n = buildNotification(title, text, i, true);
+        n.number = count;
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        nm.notify(chat, 2, buildNotification(chatName, text, i, true));
+        nm.notify(chat, 2, n);
     }
 
     @SuppressWarnings("deprecation")
@@ -293,7 +305,9 @@ public class EngineService extends Service {
                 .setContentIntent(pi)
                 .setWhen(System.currentTimeMillis());
         if (alert) {
-            b.setAutoCancel(true).setDefaults(Notification.DEFAULT_ALL);
+            b.setAutoCancel(true)
+             .setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE)
+             .setLights(0xFF25D366, 800, 2000);
         } else {
             b.setOngoing(true);
         }
@@ -301,6 +315,9 @@ public class EngineService extends Service {
     }
 
     public static void cancelChatNotification(Context ctx, String chat) {
+        synchronized (unread) {
+            unread.remove(chat);
+        }
         ((NotificationManager) ctx.getSystemService(NOTIFICATION_SERVICE)).cancel(chat, 2);
     }
 
